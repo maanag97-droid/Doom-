@@ -1,0 +1,155 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Export Android Debug APK (Godot 4.6)
+    runs-on: ubuntu-24.04
+
+    env:
+      GODOT_VERSION: "4.6"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Locate or Extract Godot Project
+        id: find_project
+        run: |
+          if [ ! -f "project.godot" ]; then
+            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+            if [ -n "$ZIP_FILE" ]; then
+              echo "Extracting $ZIP_FILE..."
+              unzip -o -q "$ZIP_FILE"
+            fi
+          fi
+          PROJECT_FILE=$(find . -maxdepth 4 -name "project.godot" | head -n 1)
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "ERROR: project.godot not found in repository!"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PROJECT_FILE")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: Setup Java 17 & Android SDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Generate Debug Keystore
+        run: |
+          keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android \
+            -keystore "${RUNNER_TEMP}/debug.keystore" -storepass android \
+            -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+
+      - name: Download Godot 4.6 & Export Templates
+        run: |
+          mkdir -p "${RUNNER_TEMP}/godot"
+          mkdir -p "${HOME}/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          curl -sSL "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip" -o "${RUNNER_TEMP}/godot.zip"
+          unzip -q "${RUNNER_TEMP}/godot.zip" -d "${RUNNER_TEMP}/godot"
+          mv "${RUNNER_TEMP}/godot/Godot_v${GODOT_VERSION}-stable_linux.x86_64" "${RUNNER_TEMP}/godot/godot"
+          chmod +x "${RUNNER_TEMP}/godot/godot"
+          curl -sSL "https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -o "${RUNNER_TEMP}/templates.tpz"
+          unzip -q "${RUNNER_TEMP}/templates.tpz" -d "${RUNNER_TEMP}/templates"
+          mv "${RUNNER_TEMP}/templates/templates/"* "${HOME}/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+
+      - name: Configure Android Export & Editor Settings
+        run: |
+          python3 - << 'PYEOF'
+          import os
+
+          proj_dir = os.environ["PROJECT_DIR"]
+          runner_temp = os.environ["RUNNER_TEMP"]
+          android_sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+          home = os.environ["HOME"]
+
+          # 1. Ensure import_etc2_astc=true in project.godot
+          pg_path = os.path.join(proj_dir, "project.godot")
+          with open(pg_path, "r") as f:
+              pg = f.read()
+          if "import_etc2_astc" not in pg:
+              if "[rendering]" in pg:
+                  pg = pg.replace("[rendering]", "[rendering]\ntextures/vram_compression/import_etc2_astc=true")
+              else:
+                  pg += "\n[rendering]\ntextures/vram_compression/import_etc2_astc=true\n"
+              with open(pg_path, "w") as f:
+                  f.write(pg)
+
+          # 2. Write clean export_presets.cfg
+          ep_path = os.path.join(proj_dir, "export_presets.cfg")
+          ep_content = f"""[preset.0]
+
+          name="Android"
+          platform="Android"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/android/DoomBoomerShooter.apk"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+
+          [preset.0.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          gradle_build/use_gradle_build=false
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          architectures/x86=false
+          architectures/x86_64=false
+          keystore/debug="{runner_temp}/debug.keystore"
+          keystore/debug_user="androiddebugkey"
+          keystore/debug_password="android"
+          package/unique_name="com.maanag.doomboomershooter"
+          package/name="DOOM Boomer Shooter 3D"
+          package/signed=true
+          screen/immersive_mode=true
+          """
+          ep_lines = [line.lstrip() for line in ep_content.splitlines()]
+          with open(ep_path, "w") as f:
+              f.write("\n".join(ep_lines) + "\n")
+
+          # 3. Write editor_settings-4.6.tres and editor_settings-4.tres
+          cfg_dir = os.path.join(home, ".config", "godot")
+          os.makedirs(cfg_dir, exist_ok=True)
+          es_content = f"""[gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "{android_sdk}"
+          export/android/debug_keystore = "{runner_temp}/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          """
+          es_lines = [line.lstrip() for line in es_content.splitlines()]
+          for fn in ("editor_settings-4.6.tres", "editor_settings-4.tres"):
+              with open(os.path.join(cfg_dir, fn), "w") as f:
+                  f.write("\n".join(es_lines) + "\n")
+          PYEOF
+
+      - name: Import Project & Export Android APK
+        run: |
+          mkdir -p "${PROJECT_DIR}/build/android"
+          "${RUNNER_TEMP}/godot/godot" --headless --path "${PROJECT_DIR}" --import || true
+          "${RUNNER_TEMP}/godot/godot" --headless --verbose --path "${PROJECT_DIR}" --export-debug "Android" "build/android/DoomBoomerShooter.apk"
+          ls -lh "${PROJECT_DIR}/build/android/DoomBoomerShooter.apk"
+
+      - name: Upload Playable Android APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoomBoomerShooter-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/android/DoomBoomerShooter.apk
+          if-no-files-found: error
